@@ -1,0 +1,156 @@
+#include <DHT.h>
+
+// ================= USER CONFIG =================
+#define DHTPIN 2
+#define DHTTYPE DHT11
+#define MQ135_PIN A0
+#define BUZZER_PIN 8
+#define HALL_PIN 3
+
+#define RL 20000.0
+float R0 = 0;
+// ==============================================
+
+// ---------------- DHT ----------------
+DHT dht(DHTPIN, DHTTYPE);
+
+// ---------------- TIMING ----------------
+const unsigned long INTERVAL_MS = 5000;
+unsigned long lastReadMillis = 0;
+
+// ---------------- ANEMOMETER ----------------
+const float RADIUS_M = 0.088;
+const float K_FACTOR = 2.2;
+const int PULSES_PER_REV = 1;
+const unsigned long DEBOUNCE_US = 3000;
+const unsigned long STOP_TIMEOUT_MS = 2000;
+
+volatile unsigned long lastPulseMicros = 0;
+volatile unsigned long pulsePeriod = 0;
+volatile unsigned long lastPulseMillis = 0;
+
+// ---------------- INTERRUPT ----------------
+void handlePulse() {
+  unsigned long nowMicros = micros();
+  if (nowMicros - lastPulseMicros < DEBOUNCE_US) return;
+  if (lastPulseMicros > 0) pulsePeriod = nowMicros - lastPulseMicros;
+  lastPulseMicros = nowMicros;
+  lastPulseMillis = millis();
+}
+
+// ---------------- MQ-135 ----------------
+float getRS() {
+  float rs = 0;
+  for (int i = 0; i < 10; i++) {
+    int adc = analogRead(MQ135_PIN);
+    if (adc == 0) adc = 1;
+    float v = adc * (5.0 / 1023.0);
+    rs += RL * (5.0 - v) / v;
+    delay(20);
+  }
+  return rs / 10.0;
+}
+
+float calibrateMQ135_CO2() {
+  float rs = 0;
+  for (int i = 0; i < 50; i++) {
+    rs += getRS();
+    delay(100);
+  }
+  rs /= 50.0;
+  float ratio = pow(400.0 / 116.6020682, -1.0 / 2.769034857);
+  return rs / ratio;
+}
+
+float getPPM_CO2(float rs) {
+  float ppm = 116.6020682 * pow(rs / R0, -2.769034857);
+  return constrain(ppm, 250, 5000);
+}
+
+float getPPM_NH3(float rs) {
+  float ppm = pow(10, (-1.67 * log10(rs / R0) + 0.86));
+  return constrain(ppm, 1, 100);
+}
+
+int getSmokeIndex(float rs) {
+  float ratio = constrain(rs / R0, 0.3, 1.5);
+  int index = (int)((1.5 - ratio) * (1000.0 / (1.5 - 0.3)));
+  return constrain(index, 0, 1000);
+}
+
+String getAirQuality(float co2, float nh3, int smoke) {
+  if (co2 >= 2000 || nh3 >= 25 || smoke >= 900) return "DANGER";
+  else if (co2 >= 1000 || nh3 >= 10 || smoke >= 600) return "POOR";
+  else if (co2 >= 600 || nh3 >= 5 || smoke >= 400) return "GOOD";
+  else return "FRESH";
+}
+
+// ---------------- SETUP ----------------
+void setup() {
+  Serial.begin(9600);
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  noTone(BUZZER_PIN);
+
+  pinMode(HALL_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(HALL_PIN), handlePulse, FALLING);
+
+  dht.begin();
+
+  delay(20000); // MQ-135 warm-up
+  R0 = calibrateMQ135_CO2();
+
+  // CSV HEADER (Excel)
+  Serial.println("Time(s),Temp(C),Humidity(%),CO2(ppm),NH3(ppm),SmokeIndex,AirQuality,Wind(m/s),Wind(km/h)");
+}
+
+// ---------------- LOOP ----------------
+void loop() {
+  unsigned long now = millis();
+
+  if (now - lastReadMillis >= INTERVAL_MS) {
+    lastReadMillis = now;
+
+    // ----- DHT -----
+    float temp = dht.readTemperature();
+    float hum = dht.readHumidity();
+    if (isnan(temp) || isnan(hum)) return;
+
+    // ----- MQ-135 -----
+    float rs = getRS();
+    float co2 = getPPM_CO2(rs);
+    float nh3 = getPPM_NH3(rs);
+    int smoke = getSmokeIndex(rs);
+    String air = getAirQuality(co2, nh3, smoke);
+
+    // ----- BUZZER -----
+    if (smoke >= 900) tone(BUZZER_PIN, 2500);
+    else noTone(BUZZER_PIN);
+
+    // ----- ANEMOMETER -----
+    float windMS = 0;
+    noInterrupts();
+    unsigned long period = pulsePeriod;
+    unsigned long lastPulse = lastPulseMillis;
+    interrupts();
+
+    if (lastPulse != 0 && (now - lastPulse) <= STOP_TIMEOUT_MS && period > 0) {
+      float circumference = 2.0 * PI * RADIUS_M;
+      float revsPerSec = 1000000.0 / period / PULSES_PER_REV;
+      windMS = K_FACTOR * revsPerSec * circumference;
+    }
+
+    float windKMH = windMS * 3.6;
+
+    // ----- CSV OUTPUT -----
+    Serial.print(now / 1000.0); Serial.print(",");
+    Serial.print(temp); Serial.print(",");
+    Serial.print(hum); Serial.print(",");
+    Serial.print(co2); Serial.print(",");
+    Serial.print(nh3); Serial.print(",");
+    Serial.print(smoke); Serial.print(",");
+    Serial.print(air); Serial.print(",");
+    Serial.print(windMS, 2); Serial.print(",");
+    Serial.println(windKMH, 2);
+  }
+}
